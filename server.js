@@ -1,6 +1,15 @@
 /**
- * MangoBlox Video Server  v2.0.0
- * Signaling + chat relay for MangoBlox WebRTC
+ * MangoBlox Server v3.0.0
+ * WebRTC signaling + chat relay + web proxy backend
+ *
+ * Proxy stack:
+ *   - Scramjet service-worker rewriter        → /scram/
+ *   - BareMux transport layer                  → /baremux/
+ *   - Epoxy (WebSocket transport via Wisp)     → /epoxy/
+ *   - LibCurl (native-fetch transport via Wisp)→ /libcurl/
+ *   - Bare Module v3                           → /baremod/
+ *   - Bare Server Node (HTTP proxy)            → /bare/
+ *   - Wisp WebSocket proxy                     → /wisp/
  */
 'use strict';
 
@@ -13,6 +22,43 @@ const { v4: uuidv4 } = require('uuid');
 const path       = require('path');
 const crypto     = require('crypto');
 
+// ─── Proxy imports (optional — graceful degradation if not installed) ───────
+let bare         = null;
+let wispServer   = null;
+let scramjetPath = null;
+let baremuxPath  = null;
+let epoxyPath    = null;
+let libcurlPath  = null;
+let bareModPath  = null;
+
+try { const { createBareServer } = require('@nebula-services/bare-server-node');
+      bare = createBareServer('/bare/', { logErrors: false, blockLocal: false });
+      console.log('[proxy] bare-server-node loaded ✓'); } catch(e) { console.warn('[proxy] bare-server-node not found — HTTP proxy disabled'); }
+
+try { const w = require('@mercuryworkshop/wisp-js/server');
+      wispServer = w.server || w;
+      if (wispServer && wispServer.options) {
+          wispServer.options.allow_loopback_ips = true;
+          wispServer.options.allow_private_ips  = true;
+      }
+      console.log('[proxy] wisp-js loaded ✓'); } catch(e) { console.warn('[proxy] wisp-js not found — WebSocket proxy disabled'); }
+
+try { scramjetPath = require('@mercuryworkshop/scramjet/path').scramjetPath;
+      console.log('[proxy] scramjet loaded from', scramjetPath); } catch(e) { console.warn('[proxy] scramjet not found'); }
+
+try { baremuxPath  = require('@mercuryworkshop/bare-mux/node').baremuxPath;
+      console.log('[proxy] bare-mux loaded ✓'); } catch(e) { console.warn('[proxy] bare-mux not found'); }
+
+try { epoxyPath    = require('@mercuryworkshop/epoxy-transport').epoxyPath;
+      console.log('[proxy] epoxy-transport loaded ✓'); } catch(e) { console.warn('[proxy] epoxy-transport not found'); }
+
+try { libcurlPath  = require('@mercuryworkshop/libcurl-transport').libcurlPath;
+      console.log('[proxy] libcurl-transport loaded ✓'); } catch(e) { console.warn('[proxy] libcurl-transport not found'); }
+
+try { bareModPath  = require('@mercuryworkshop/bare-as-module3').bareModulePath;
+      console.log('[proxy] bare-as-module3 loaded ✓'); } catch(e) { console.warn('[proxy] bare-as-module3 not found'); }
+
+// ─── Config ────────────────────────────────────────────────────────────────
 const PORT            = parseInt(process.env.PORT)         || 3000;
 const API_KEY_SECRET  = process.env.API_KEY_SECRET         || 'mangokey_change_me';
 const TURN_ENABLED    = process.env.TURN_ENABLED === 'true';
@@ -26,9 +72,22 @@ const MAX_MSG_LEN     = 4096;
 const MAX_CHAT_HIST   = 200;
 const MAX_FILE_B64    = 20 * 1024 * 1024;
 
+// ─── App ───────────────────────────────────────────────────────────────────
 const app    = express();
 const server = http.createServer(app);
-const io     = new Server(server, {
+
+// ─── Handle WebSocket upgrades BEFORE Socket.IO attaches ──────────────────
+server.on('upgrade', function(req, socket, head) {
+    const url = req.url || '';
+    if (bare && bare.shouldRoute(req)) {
+        bare.routeUpgrade(req, socket, head);
+    } else if (wispServer && url.startsWith('/wisp/')) {
+        wispServer.routeRequest(req, socket, head);
+    }
+    // Socket.IO handles /socket.io/ upgrades through its own internal engine
+});
+
+const io = new Server(server, {
     cors:              { origin: '*', methods: ['GET', 'POST'] },
     pingInterval:      25000,
     pingTimeout:       15000,
@@ -37,8 +96,36 @@ const io     = new Server(server, {
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
+
+// ─── Bare HTTP proxy middleware ─────────────────────────────────────────────
+if (bare) {
+    app.use(function(req, res, next) {
+        if (bare.shouldRoute(req)) bare.routeRequest(req, res);
+        else next();
+    });
+}
+
+// ─── COEP / COOP headers for proxy routes ──────────────────────────────────
+// Required by SharedArrayBuffer (libcurl/epoxy transports)
+const proxyPaths = ['/proxy', '/sw.js', '/config.js', '/scram', '/baremux', '/epoxy', '/libcurl', '/baremod', '/bare'];
+app.use(proxyPaths, function(req, res, next) {
+    res.setHeader('Cross-Origin-Opener-Policy',   'same-origin');
+    res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    next();
+});
+
+// ─── Static proxy asset routes ─────────────────────────────────────────────
+if (scramjetPath) app.use('/scram',    express.static(scramjetPath));
+if (baremuxPath)  app.use('/baremux',  express.static(baremuxPath));
+if (epoxyPath)    app.use('/epoxy',    express.static(epoxyPath));
+if (libcurlPath)  app.use('/libcurl',  express.static(libcurlPath));
+if (bareModPath)  app.use('/baremod',  express.static(bareModPath));
+
+// Serve proxy page + service worker from current directory
 app.use(express.static(path.join(__dirname)));
 
+// ─── In-memory state ───────────────────────────────────────────────────────
 const rooms      = new Map();
 const socketMeta = new Map();
 
@@ -119,10 +206,12 @@ function apiAuth(req, res, next) {
     next();
 }
 
+// ─── REST API ──────────────────────────────────────────────────────────────
 app.get('/health', function(_, res) {
     res.json({ ok: true, rooms: rooms.size,
         peers: Array.from(rooms.values()).reduce(function(n,r) { return n + r.peers.size; }, 0),
-        uptime: Math.round(process.uptime()), version: '2.0.0' });
+        uptime: Math.round(process.uptime()), version: '3.0.0',
+        proxy: { bare: !!bare, wisp: !!wispServer, scramjet: !!scramjetPath } });
 });
 app.get('/api/rooms', apiAuth, function(_, res) {
     const list = []; rooms.forEach(function(r) { list.push({ id: r.id, name: r.name, peerCount: r.peers.size, locked: r.locked, hasPassword: !!r.password, createdAt: r.createdAt }); });
@@ -159,7 +248,49 @@ app.get('/join', function(req, res) {
     const { room, name } = req.query; if (!room) return res.redirect('/');
     const p = new URLSearchParams({ room, name: name || 'Guest' }); res.redirect(`/#join?${p.toString()}`);
 });
+/* /px — server-side fetch proxy: tunnels any URL through Railway */
+app.get('/px', async function(req, res) {
+    const target = req.query.url;
+    if (!target) return res.status(400).json({ error: 'url required' });
+    let parsed;
+    try { parsed = new URL(target); } catch(e) { return res.status(400).json({ error: 'invalid url' }); }
+    if (!['http:', 'https:'].includes(parsed.protocol)) return res.status(400).json({ error: 'protocol not allowed' });
 
+    try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 15000);
+        const upstream = await fetch(target, {
+            signal: controller.signal,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Cache-Control': 'no-cache',
+            },
+            redirect: 'follow',
+        });
+        clearTimeout(timer);
+
+        const ct = upstream.headers.get('content-type') || 'text/html; charset=utf-8';
+        res.setHeader('Content-Type', ct);
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('X-Frame-Options', 'ALLOWALL');
+        res.removeHeader('Content-Security-Policy');
+
+        if (ct.includes('text/html')) {
+            let html = await upstream.text();
+            // Inject <base> tag so relative URLs resolve against the real origin
+            html = html.replace(/(<head[^>]*>)/i, '$1<base href="' + parsed.origin + '/">');
+            res.send(html);
+        } else {
+            res.send(Buffer.from(await upstream.arrayBuffer()));
+        }
+    } catch(e) {
+        res.status(e.name === 'AbortError' ? 504 : 502).json({ error: e.message });
+    }
+});
+
+// ─── Socket.IO ─────────────────────────────────────────────────────────────
 io.on('connection', function(socket) {
     console.log(`[connect] ${socket.id}`);
 
@@ -168,16 +299,12 @@ io.on('connection', function(socket) {
         const { roomId, roomName, name, avatar, password, peerId: existingPeerId } = data;
         if (!roomId) return socket.emit('join-err', { reason: 'roomId required' });
         if (!name)   return socket.emit('join-err', { reason: 'name required' });
-
         if (!rooms.has(roomId)) { rooms.set(roomId, makeRoom(roomId, roomName || null, null)); console.log(`[room] ${roomId} created`); }
         const room = getRoom(roomId);
-
         if (room.locked && room.hostId !== socket.id) return socket.emit('join-err', { reason: 'Room is locked' });
         if (room.password && room.password !== password) return socket.emit('join-err', { reason: 'Wrong password' });
         if (room.peers.size >= MAX_PER_ROOM) return socket.emit('join-err', { reason: `Room full (max ${MAX_PER_ROOM})` });
-
         if (socketMeta.has(socket.id)) handleLeave(socket.id);
-
         const isHost = room.peers.size === 0 || room.hostId === null;
         const peerId = existingPeerId || uuidv4();
         const peer   = makePeer(socket.id, peerId, name, avatar || null, isHost);
@@ -185,7 +312,6 @@ io.on('connection', function(socket) {
         if (isHost) room.hostId = socket.id;
         socket.join(roomId);
         socketMeta.set(socket.id, { roomId, peerId });
-
         console.log(`[join] "${peer.name}" → ${roomId}${isHost?' [HOST]':''} (${room.peers.size} total)`);
         socket.emit('join-ack', { peer: peerPublic(peer), room: roomPublic(room), isHost });
         broadcast(roomId, 'peer-joined', { peer: peerPublic(peer) }, socket.id);
@@ -312,7 +438,6 @@ io.on('connection', function(socket) {
         const peer = getPeer(meta.roomId, socket.id); if (!peer) return;
         broadcast(meta.roomId, 'caption', { from: socket.id, fromName: peer.name, text: (d.text||'').slice(0,500), final: !!d.final }, socket.id);
     });
-
     socket.on('recording-start', function() {
         const meta = socketMeta.get(socket.id); if (!meta) return;
         const peer = getPeer(meta.roomId, socket.id); if (!peer) return;
@@ -325,7 +450,6 @@ io.on('connection', function(socket) {
         peer.isRecording = false;
         broadcast(meta.roomId, 'peer-recording-stop', { socketId: socket.id }, socket.id);
     });
-
     socket.on('snapshot', function(d) {
         const meta = socketMeta.get(socket.id); if (!meta || !d) return;
         const peer = getPeer(meta.roomId, socket.id); if (!peer) return;
@@ -345,15 +469,12 @@ io.on('connection', function(socket) {
         const room = getRoom(meta.roomId); if (!room || room.hostId !== socket.id) return;
         fn(room, meta.roomId);
     }
-    socket.on('kick-peer', function(d) { withHost(function(room, roomId) {
-        const t = d && d.socketId; if (!t || t === socket.id || !room.peers.has(t)) return;
-        io.to(t).emit('kicked', { reason: 'Removed by host' }); handleLeave(t);
-    }); });
-    socket.on('mute-peer',   function(d) { withHost(function(room) { const t = d&&d.socketId; if (t && room.peers.has(t)) io.to(t).emit('force-mute', {}); }); });
-    socket.on('hide-peer',   function(d) { withHost(function(room) { const t = d&&d.socketId; if (t && room.peers.has(t)) io.to(t).emit('force-hide', {}); }); });
-    socket.on('request-snapshot', function(d) { withHost(function(room) { const t = d&&d.socketId; if (t && room.peers.has(t)) io.to(t).emit('snapshot-request', { fromSocketId: socket.id }); }); });
-    socket.on('lock-room', function() { withHost(function(room, roomId) { room.locked = !room.locked; broadcastAll(roomId, 'room-lock-changed', { locked: room.locked }); }); });
-    socket.on('end-meeting', function() { withHost(function(room, roomId) {
+    socket.on('kick-peer',        function(d) { withHost(function(room, roomId) { const t = d&&d.socketId; if (!t||t===socket.id||!room.peers.has(t)) return; io.to(t).emit('kicked', { reason: 'Removed by host' }); handleLeave(t); }); });
+    socket.on('mute-peer',        function(d) { withHost(function(room) { const t = d&&d.socketId; if (t&&room.peers.has(t)) io.to(t).emit('force-mute', {}); }); });
+    socket.on('hide-peer',        function(d) { withHost(function(room) { const t = d&&d.socketId; if (t&&room.peers.has(t)) io.to(t).emit('force-hide', {}); }); });
+    socket.on('request-snapshot', function(d) { withHost(function(room) { const t = d&&d.socketId; if (t&&room.peers.has(t)) io.to(t).emit('snapshot-request', { fromSocketId: socket.id }); }); });
+    socket.on('lock-room',        function()  { withHost(function(room, roomId) { room.locked = !room.locked; broadcastAll(roomId, 'room-lock-changed', { locked: room.locked }); }); });
+    socket.on('end-meeting',      function()  { withHost(function(room, roomId) {
         broadcastAll(roomId, 'meeting-ended', { reason: 'Host ended the meeting' });
         fireWebhook('room-end', { roomId, roomName: room.name });
         room.peers.forEach(function(p) { socketMeta.delete(p.socketId); const s = io.sockets.sockets.get(p.socketId); if (s) s.leave(roomId); });
@@ -364,28 +485,33 @@ io.on('connection', function(socket) {
         const meta = socketMeta.get(socket.id); if (!meta || !d) return;
         const peer = getPeer(meta.roomId, socket.id); if (!peer) return;
         const name = (d.name || '').trim().slice(0,60); if (!name) return;
-        peer.name = name;
-        broadcastAll(meta.roomId, 'peer-info-updated', { socketId: socket.id, peerId: peer.peerId, name });
+        peer.name = name; broadcastAll(meta.roomId, 'peer-info-updated', { socketId: socket.id, peerId: peer.peerId, name });
     });
     socket.on('update-avatar', function(d) {
         const meta = socketMeta.get(socket.id); if (!meta || !d) return;
         const peer = getPeer(meta.roomId, socket.id); if (!peer) return;
-        peer.avatar = d.avatar || null;
-        broadcastAll(meta.roomId, 'peer-info-updated', { socketId: socket.id, peerId: peer.peerId, avatar: peer.avatar });
+        peer.avatar = d.avatar || null; broadcastAll(meta.roomId, 'peer-info-updated', { socketId: socket.id, peerId: peer.peerId, avatar: peer.avatar });
     });
 
-    socket.on('ping', function() { socket.emit('pong', { ts: Date.now() }); });
-    socket.on('disconnect', function(reason) { console.log(`[disconnect] ${socket.id} — ${reason}`); handleLeave(socket.id); });
-    socket.on('error', function(err) { console.error(`[socket-err] ${socket.id}:`, err.message); });
+    socket.on('ping',       function()    { socket.emit('pong', { ts: Date.now() }); });
+    socket.on('disconnect', function(r)   { console.log(`[disconnect] ${socket.id} — ${r}`); handleLeave(socket.id); });
+    socket.on('error',      function(err) { console.error(`[socket-err] ${socket.id}:`, err.message); });
 });
 
+// ─── Stale-room cleanup ────────────────────────────────────────────────────
 setInterval(function() {
     const cutoff = Date.now() - 3600000;
     rooms.forEach(function(room, id) { if (room.peers.size === 0 && room.createdAt < cutoff) { rooms.delete(id); console.log(`[cleanup] ${id} removed`); } });
 }, 300000);
 
+// ─── Start ─────────────────────────────────────────────────────────────────
 server.listen(PORT, function() {
-    console.log(`\n  MangoBlox Server v2.0.0  →  http://localhost:${PORT}\n`);
+    console.log(`\n  MangoBlox Server v3.0.0  →  http://localhost:${PORT}`);
+    console.log(`  Proxy page            →  http://localhost:${PORT}/proxy`);
+    console.log(`  Bare HTTP proxy       →  ${bare ? 'http://localhost:' + PORT + '/bare/' : 'disabled'}`);
+    console.log(`  Wisp WebSocket proxy  →  ${wispServer ? 'ws://localhost:' + PORT + '/wisp/' : 'disabled'}`);
+    console.log(`  Scramjet assets       →  ${scramjetPath || 'not installed'}`);
+    console.log('');
     if (WEBHOOK_ENABLED) console.log('  Webhook → ' + WEBHOOK_URL);
     if (TURN_ENABLED)    console.log('  TURN    → ' + TURN_URLS);
 });
