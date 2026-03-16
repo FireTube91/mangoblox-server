@@ -14,9 +14,6 @@
     "socket.io": "^4.7.5",
     "uuid": "^10.0.0"
   },
-  "optionalDependencies": {
-    "node-fetch": "^3.3.2"
-  },
   "engines": {
     "node": ">=18.0.0"
   }
